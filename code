@@ -1,0 +1,865 @@
+package com.etihad.microservices.bookcoach.service;
+
+import java.sql.Time;
+import java.sql.Timestamp;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.List;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.stereotype.Service;
+
+import com.eag.library.pnrlookup.request.Request;
+import com.eag.library.pnrlookup.response.PaxDetail;
+import com.eag.library.pnrlookup.response.Response;
+import com.etihad.library.annotation.Logging;
+import com.etihad.library.errors.exception.APIException;
+import com.etihad.library.errors.util.APIErrorUtil;
+import com.etihad.microservices.bookcoach.adaptor.PNRLookUpServiceAdaptor;
+import com.etihad.microservices.bookcoach.broker.PNRLookUpServiceBroker;
+import com.etihad.microservices.bookcoach.config.BookCoachConfiguration;
+import com.etihad.microservices.bookcoach.constants.Constants;
+import com.etihad.microservices.bookcoach.entity.CoachConfig;
+import com.etihad.microservices.bookcoach.entity.CoachSchedule;
+import com.etihad.microservices.bookcoach.entity.FlightBasedCoachBookingMin;
+import com.etihad.microservices.bookcoach.response.LegDetails;
+import com.etihad.microservices.bookcoach.response.PNRResponse;
+import com.etihad.microservices.bookcoach.response.Route;
+import com.etihad.microservices.bookcoach.response.Schedule;
+import com.etihad.microservices.bookcoach.response.Segment;
+
+@Service
+public class PNREligibilityService {
+
+	private static final Logger LOGGER = LoggerFactory.getLogger(PNREligibilityService.class);
+
+	@Autowired
+	CoachConfigService coachConfigService;
+
+	@Autowired
+	FlightBasedCoachBookingMinService flightBasedCoachBookingMinService;
+
+	@Autowired
+	CoachScheduleService coachScheduleService;
+
+	@Autowired
+	PNRLookUpServiceBroker pnrLookUpServiceBroker;
+
+	@Autowired
+	PNRLookUpServiceAdaptor pnrLookUpServiceAdaptor;
+
+	@Autowired
+	BookCoachConfiguration bookCoachConfig;
+
+	@Autowired
+	APIErrorUtil apiErrorUtil;
+
+	@Logging
+	public PNRResponse validateEligibilty(Request request, String siteEdtn) throws APIException {
+		Response response = pnrLookUpServiceBroker.getPNRInformation(request, siteEdtn);
+		PNRResponse pnrResponse = pnrLookUpServiceAdaptor.constructPNRResponse(response);
+		invokeValidations(pnrResponse.getSegmentList());
+		setEligibility(pnrResponse.getSegmentList());
+		checkEligibility(pnrResponse.getSegmentList());
+		checkChaufferEligibility(pnrResponse.getSegmentList());
+		return pnrResponse;
+	}
+
+	private void invokeValidations(List<Segment> segmentList) {
+		CoachConfig coachConfig = coachConfigService.getCoachConfig().get(0);
+		for (Segment segment : segmentList) {
+			validOriginSegment(segment);
+			validDestinationSegment(segment);
+			validBooking(segment, coachConfig);
+			validPaxType(segment);
+			validCoachEligibleRBDs(segment, coachConfig);
+			validChaufferEligibileRBDs(segment, coachConfig);
+			validOperatingCarrier(segment, coachConfig);
+			validTransitFlight(segment);
+			validDifferenceBetweenDepurtureTimeAndCurrentTime(segment, coachConfig);
+			validDifferenceBetweenArrivalTimeAndCurrentTime(segment, coachConfig);
+			isCoachAlreadyBooked(segment, coachConfig);
+		}
+		populateCoachScheduleInformation(segmentList);
+	}
+
+	private void isCoachAlreadyBooked(Segment segment, CoachConfig coachConfig) {
+		List<String> eligibleCoachStationCodes = Arrays.asList(coachConfig.getCoachStationIATACodes().split(","));
+		boolean coachBookedAtOrigin = isCoachAlreadyBooked(segment.getLegDetailsList().get(0).getOriginAirportCode(),
+				eligibleCoachStationCodes);
+		boolean coachBookedAtDestination = isCoachAlreadyBooked(
+				segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1).getDestinationLegAirportCode(),
+				eligibleCoachStationCodes);
+		if (coachBookedAtOrigin || coachBookedAtDestination) {
+			segment.setValidCoachBooking(true);
+		}
+	}
+
+	private boolean isCoachAlreadyBooked(String airport, List<String> eligibleCoachStationCodes) {
+		return eligibleCoachStationCodes.stream().anyMatch(s -> s.equalsIgnoreCase(airport));
+	}
+
+	private void validTransitFlight(Segment segment) {
+		if (!segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())
+				&& !segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			segment.setValidTransitFlight(true);
+		}
+	}
+
+	private void validDifferenceBetweenDepurtureTimeAndCurrentTime(Segment segment, CoachConfig coachConfig) {
+		String date = null;
+		String time = null;
+		if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			date = segment.getLegDetailsList().get(0).getFlightLegStartDate();
+			time = segment.getLegDetailsList().get(0).getFlightLegStartTime();
+			Duration duration = calculateDuration(date, time);
+			if ((duration.toMinutes() >= coachConfig.getBlackoutDepartingFlightsMin())
+					&& (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode()))) {
+				segment.setDepartFlightBlackOutEligible(true);
+			}
+		}
+	}
+
+	private void validDifferenceBetweenArrivalTimeAndCurrentTime(Segment segment, CoachConfig coachConfig) {
+		String date = null;
+		String time = null;
+		if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			date = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1).getFlightLegEndDate();
+			time = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1).getFlightLegEndTime();
+			Duration duration = calculateDuration(date, time);
+			if ((duration.toMinutes() >= coachConfig.getBlackoutArrivingFlightsMin())
+					&& (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode()))) {
+				segment.setArrivalFlightBlckOutEligible(true);
+			}
+		}
+	}
+
+	private Duration calculateDuration(String date, String time) {
+		ZoneId dubaiZoneId = ZoneId.of(bookCoachConfig.getZone());
+		LocalDateTime localdate = LocalDateTime.now();
+		ZonedDateTime currentDateTime = localdate.atZone(dubaiZoneId);
+		String flightDateTime = date + Constants.VALUE_T + time;
+		LocalDateTime flightLocalDateTime = LocalDateTime.parse(flightDateTime);
+		ZonedDateTime flightZoneTime = flightLocalDateTime.atZone(dubaiZoneId);
+		return Duration.between(currentDateTime, flightZoneTime);
+	}
+
+	private void setEligibility(List<Segment> segmentList) {
+		for (Segment segment : segmentList) {
+			if (segment.isValidOriginSegment() || segment.isValidDestinationSegment()) {
+				if (segment.isValidBooking()) {
+					if (segment.isValidPax()) {
+						if (segment.isValidCoachRBds()) {
+							if (!segment.isValidChaufferRBds()) {
+								if (segment.isValidOperatingCarrier()) {
+									if (!segment.isValidTransitFlight()) {
+										if (!segment.isValidCoachBooking()) {
+											if ((segment.isArrivalFlightBlckOutEligible())
+													|| (segment.isDepartFlightBlackOutEligible())) {
+												if (segment.isValidCoachScheduleAvailable()) {
+													segment.setSegmentEligible(true);
+												} else {
+													segment.setSegmentNotEligibleInfo(
+															Constants.COACH_SCHEDULE_NOT_AVAILABLE_ERROR_CODE);
+												}
+											} else {
+												segment.setSegmentNotEligibleInfo(Constants.FLIGHT_BLACKOUT_ERROR_CODE);
+											}
+										} else {
+											segment.setSegmentNotEligibleInfo(Constants.VALID_COACH_BOOKING_ERROR_CODE);
+										}
+									} else {
+										segment.setSegmentNotEligibleInfo(Constants.TRANSIT_FLIGHT_ERROR_CODE);
+									}
+								} else {
+									segment.setSegmentNotEligibleInfo(Constants.OPERATING_CARRIER_ERROR_CODE);
+								}
+							} else {
+								segment.setSegmentNotEligibleInfo(Constants.CHAUFFER_ELIGIBLE_ERROR_CODE);
+							}
+						} else {
+							if (segment.isValidChaufferRBds()) {
+								segment.setSegmentNotEligibleInfo(Constants.CHAUFFER_ELIGIBLE_ERROR_CODE);
+							} else {
+								segment.setSegmentNotEligibleInfo(Constants.COACH_RBD_ERROR_CODE);
+							}
+						}
+					}
+
+					else {
+						segment.setSegmentNotEligibleInfo(Constants.PAX_ERROR_CODE);
+					}
+				} else {
+					segment.setSegmentNotEligibleInfo(Constants.VALID_BOOKING_ERROR_CODE);
+				}
+			} else {
+				segment.setSegmentNotEligibleInfo(Constants.FIRST_LEG_INELIGIBLE_ERROR_CODE);
+			}
+		}
+	}
+
+	private void checkEligibility(List<Segment> segmentList) throws APIException {
+		boolean segmentEligible = false;
+		boolean isTransitFlight = false;
+		boolean isNotEtihadOperated = false;
+		boolean isCoachAlreadyBooked = false;
+		boolean isInBlackOut = false;
+		boolean isCoachScheduleAvailable = false;
+		for (Segment segment : segmentList) {
+			if (segment.isSegmentEligible() || segment.isValidChaufferRBds()) {
+				segmentEligible = true;
+			}
+		}
+		for (Segment segment : segmentList) {
+			if (!segmentEligible) {
+				if (!segment.isValidOriginSegment() && !segment.isValidDestinationSegment()) {
+					isTransitFlight = true;
+					break;
+				} else if (!segment.isValidOperatingCarrier()) {
+					isNotEtihadOperated = true;
+					break;
+				} else if (segment.isValidCoachBooking()) {
+					isCoachAlreadyBooked = true;
+					break;
+				} else if (!segment.isArrivalFlightBlckOutEligible() && !segment.isDepartFlightBlackOutEligible()) {
+					isInBlackOut = true;
+					break;
+				} else if (!segment.isValidCoachScheduleAvailable()) {
+					isCoachScheduleAvailable = true;
+					break;
+				}
+			}
+
+		}
+		if (!segmentEligible && isTransitFlight) {
+			throwCustomErrorMessage(Constants.TRANSIT_FLIGHT_ERROR_CODE, Constants.TRANSIT_FLIGHT_ERROR_MSG);
+		}
+		if (!segmentEligible && isNotEtihadOperated) {
+			throwCustomErrorMessage(Constants.OPERATING_CARRIER_ERROR_CODE, Constants.OPERATING_CARRIER_ERROR_MSG);
+		}
+		if (!segmentEligible && isCoachAlreadyBooked) {
+			throwCustomErrorMessage(Constants.VALID_BOOKING_ERROR_CODE, Constants.VALID_BOOKING_ERROR_MSG);
+		}
+		if (!segmentEligible && isInBlackOut) {
+			throwCustomErrorMessage(Constants.FLIGHT_BLACKOUT_ERROR_CODE, Constants.FLIGHT_BLACKOUT_ERROR_MSG);
+		}
+		if (!segmentEligible && isCoachScheduleAvailable) {
+			throwCustomErrorMessage(Constants.COACH_SCHEDULE_NOT_AVAILABLE_ERROR_CODE,
+					Constants.COACH_SCHEDULE_NOT_AVAILABLE_ERROR_MSG);
+		}
+		if (!segmentEligible) {
+			throwCustomErrorMessage(Constants.COACH_NOT_ELIGIBLE_ERROR_CODE, Constants.COACH_NOT_ELIGIBLE_ERROR_MSG);
+		}
+	}
+
+	private void throwCustomErrorMessage(String errorCode, String errorMsg) throws APIException {
+		throw new APIException(
+				apiErrorUtil.constructAPIErrors(Constants.ERROR, errorCode, errorMsg, Constants.SOURCE_BOOKCOACH),
+				apiErrorUtil.constructLogMessage(Constants.ERROR, errorCode, errorMsg, Constants.SOURCE_BOOKCOACH,
+						String.valueOf(HttpStatus.OK.value())),
+				String.valueOf(HttpStatus.OK.value()));
+
+	}
+
+	private void checkChaufferEligibility(List<Segment> segmentList) throws APIException {
+		boolean chaufferEligible = false;
+		boolean segmentEligible = false;
+		for (Segment segment : segmentList) {
+			if (segment.isValidChaufferRBds()) {
+				chaufferEligible = true;
+			}
+			if (segment.isSegmentEligible()) {
+				segmentEligible = true;
+			}
+		}
+		if (chaufferEligible && !segmentEligible) {
+			throw new APIException(
+					apiErrorUtil.constructAPIErrors(Constants.ERROR, Constants.CHAUFFER_ELIGIBLE_ERROR_CODE,
+							Constants.CHAUFFER_ELIGIBLE_ERROR_MSG, Constants.SOURCE_BOOKCOACH),
+					apiErrorUtil.constructLogMessage(Constants.ERROR, Constants.CHAUFFER_ELIGIBLE_ERROR_CODE,
+							Constants.CHAUFFER_ELIGIBLE_ERROR_MSG, Constants.SOURCE_BOOKCOACH,
+							String.valueOf(HttpStatus.OK.value())),
+					String.valueOf(HttpStatus.OK.value()));
+		}
+	}
+
+	private void validOriginSegment(Segment segment) {
+		if (segment.getLegDetailsList().get(0).getOriginAirportCode()
+				.equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			segment.setValidOriginSegment(true);
+		}
+	}
+
+	private void validDestinationSegment(Segment segment) {
+		if (segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1).getDestinationLegAirportCode()
+				.equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			segment.setValidDestinationSegment(true);
+		}
+	}
+
+	private void validBooking(Segment segment, CoachConfig coachConfig) {
+		List<String> eligiblePNRStatusList = Arrays.asList(coachConfig.getEligiblePNRStatus().split(","));
+		if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails firstLeg = segment.getLegDetailsList().get(0);
+			if (eligiblePNRStatusList.contains(firstLeg.getActionCode())) {
+				segment.setValidBooking(true);
+			}
+		}
+		if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails lastLeg = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1);
+			if (eligiblePNRStatusList.contains(lastLeg.getActionCode())) {
+				segment.setValidBooking(true);
+			}
+		}
+	}
+
+	private void validPaxType(Segment segment) {
+		if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails firstLeg = segment.getLegDetailsList().get(0);
+			segment.setValidPax(validatePaxType(firstLeg.getPaxDetails()));
+		}
+		if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails lastLeg = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1);
+			segment.setValidPax(validatePaxType(lastLeg.getPaxDetails()));
+		}
+	}
+
+	private boolean validatePaxType(List<PaxDetail> paxDetails) {
+		boolean validPax = false;
+		for (PaxDetail pax : paxDetails) {
+			if (pax.getPaxTypeCode() != null) {
+				if (pax.getPaxTypeCode().equalsIgnoreCase(bookCoachConfig.getPaxTypeCode())) {
+					validPax = true;
+					break;
+				}
+			} else {
+				validPax = true;
+				break;
+			}
+		}
+		return validPax;
+	}
+
+	private void validCoachEligibleRBDs(Segment segment, CoachConfig coachConfig) {
+		String coachEligibileRBDs = coachConfig.getCoachEligibileRBDs();
+		List<String> eligibleRBDs = Arrays.asList(coachEligibileRBDs.split(","));
+		if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails firstLeg = segment.getLegDetailsList().get(0);
+			segment.setValidCoachRBds(validateCoachEligibleRBDs(firstLeg.getOperatingClassOfService(), eligibleRBDs));
+		}
+		if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails lastLeg = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1);
+			segment.setValidCoachRBds(validateCoachEligibleRBDs(lastLeg.getOperatingClassOfService(), eligibleRBDs));
+		}
+	}
+
+	private boolean validateCoachEligibleRBDs(String operatingClassOfService, List<String> eligibleRBDs) {
+		return eligibleRBDs.stream().anyMatch(s -> s.equalsIgnoreCase(operatingClassOfService));
+
+	}
+
+	private void validChaufferEligibileRBDs(Segment segment, CoachConfig coachConfig) {
+		List<String> chaufferEligibileRBDs = Arrays.asList(coachConfig.getChaufferEligibileRBDs().split(","));
+		if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails firstLeg = segment.getLegDetailsList().get(0);
+			segment.setValidChaufferRBds(
+					validateChaufferElgibileRBDs(firstLeg.getOperatingClassOfService(), chaufferEligibileRBDs));
+		}
+		if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails lastLeg = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1);
+			segment.setValidChaufferRBds(
+					validateChaufferElgibileRBDs(lastLeg.getOperatingClassOfService(), chaufferEligibileRBDs));
+
+		}
+	}
+
+	private boolean validateChaufferElgibileRBDs(String operatingClassOfService, List<String> chaufferElgibileRBDs) {
+		return chaufferElgibileRBDs.stream().anyMatch(s -> s.equalsIgnoreCase(operatingClassOfService));
+	}
+
+	private void validOperatingCarrier(Segment segment, CoachConfig coachConfig) {
+		List<String> eligibleOperatingCarrierCodes = Arrays
+				.asList(coachConfig.getEligibleOperatingCarrierCodes().split(","));
+		if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails firstLeg = segment.getLegDetailsList().get(0);
+			segment.setValidOperatingCarrier(
+					validateOperatingCarrier(firstLeg.getOperatedBy(), eligibleOperatingCarrierCodes));
+		}
+		if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+			LegDetails lastLeg = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1);
+			segment.setValidOperatingCarrier(
+					validateOperatingCarrier(lastLeg.getOperatedBy(), eligibleOperatingCarrierCodes));
+		}
+	}
+
+	private boolean validateOperatingCarrier(String operatingCarrier, List<String> eligibleOperatingCarrierCodes) {
+		return eligibleOperatingCarrierCodes.stream().anyMatch(s -> s.equalsIgnoreCase(operatingCarrier));
+	}
+
+	private void populateCoachScheduleInformation(List<Segment> segmentList) {
+		List<CoachSchedule> coachScheduleBeforeArrivalOrDepurtureFilter = coachScheduleService.getCoachSchedule();
+		List<CoachSchedule> coachScheduleArrivalFilteredList = coachArrivalToAUHSchedule(
+				coachScheduleBeforeArrivalOrDepurtureFilter);
+		List<CoachSchedule> coachScheduleDepurtureFilteredList = coachDepurtureFromAUHSchedule(
+				coachScheduleBeforeArrivalOrDepurtureFilter);
+		for (Segment segment : segmentList) {
+			if (segment.getOriginAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+				boolean ifScheduleExistsCoachArrivingAUH = ifScheduleExists(coachScheduleArrivalFilteredList, segment);
+				if (!ifScheduleExistsCoachArrivingAUH) {
+					segment.setValidCoachScheduleAvailable(false);
+				} else {
+					String flightNumber = segment.getLegDetailsList().get(0).getFlightNumber();
+					int coachArrivalBookingMinutes = getFlightBookingMinutes(flightNumber);
+					String timeString = segment.getLegDetailsList().get(0).getFlightLegStartTime();
+					String dateString = segment.getLegDetailsList().get(0).getFlightLegStartDate();
+					Timestamp flightDepurtureDate = substractMinutes(timeString, dateString,
+							coachArrivalBookingMinutes);
+
+					List<CoachSchedule> coachScheduleArrivalSortedList = createSortedCoachSchedule(
+							coachScheduleArrivalFilteredList, flightDepurtureDate);
+					List<Route> routes = new ArrayList<>();
+					Route route1 = constructRoutes("AAN", "AUH");
+					Route route2 = constructRoutes("XNB", "AUH");
+					int countOfAANCoaches = 0;
+					int countOfXNBCoaches = 0;
+					int numberOfCoachesToReturn = coachConfigService.getCoachConfig()
+							.get(coachConfigService.getCoachConfig().size() - 1).getNumberOfCoachesToReturn();
+					for (CoachSchedule coachScheduleObjAAN : coachScheduleArrivalSortedList) {
+						String dateStringSet = dateString;
+						SimpleDateFormat sdfFlightDepartureDate = new SimpleDateFormat(Constants.DATE_FORMAT);
+						String date1 = sdfFlightDepartureDate.format(flightDepurtureDate);
+						long timeCheck = 0;
+						try {
+							timeCheck = sdfFlightDepartureDate.parse(date1).getTime();
+						} catch (ParseException e1) {
+
+							LOGGER.error(
+									"Error in method populateCoachScheduleInformation() of PNREligibilityService {} in sdfFlightDepartureDate parse time",
+									e1.getMessage());
+						}
+						if (coachScheduleObjAAN.getDepartureTime().getTime() > timeCheck) {
+							SimpleDateFormat sdfCoachDateAAN = new SimpleDateFormat(Constants.YEAR_FORMAT);
+							Calendar cCoachDateAAN = Calendar.getInstance();
+							try {
+								cCoachDateAAN.setTime(sdfCoachDateAAN.parse(dateString));
+							} catch (ParseException e) {
+								LOGGER.error(
+										"Error in method populateCoachScheduleInformation() of PNREligibilityService {} in cCoachDateAAN set time",
+										e.getMessage());
+							}
+							cCoachDateAAN.add(Calendar.DAY_OF_MONTH, -1);
+							dateStringSet = sdfCoachDateAAN.format(cCoachDateAAN.getTime());
+						}
+						if (coachScheduleObjAAN.getDepartureStation().equalsIgnoreCase("AAN")
+								&& countOfAANCoaches < numberOfCoachesToReturn) {
+							route1.getSchedules()
+									.add(constructSchedule(coachScheduleObjAAN.getDepartureTime().toString(),
+											coachScheduleObjAAN.getArrivalTime().toString(),
+											"EY " + coachScheduleObjAAN.getCoachNumber(), dateStringSet));
+							countOfAANCoaches++;
+						}
+						if (coachScheduleObjAAN.getDepartureStation().equalsIgnoreCase("XNB")
+								&& countOfXNBCoaches < numberOfCoachesToReturn) {
+							route2.getSchedules()
+									.add(constructSchedule(coachScheduleObjAAN.getDepartureTime().toString(),
+											coachScheduleObjAAN.getArrivalTime().toString(),
+											"EY " + coachScheduleObjAAN.getCoachNumber(), dateStringSet));
+							countOfXNBCoaches++;
+						}
+					}
+					if (countOfAANCoaches < numberOfCoachesToReturn) {
+						addAANToAUHCoach(numberOfCoachesToReturn, coachScheduleArrivalFilteredList, route1, dateString);
+					}
+					if (countOfXNBCoaches < numberOfCoachesToReturn) {
+						addXNBToAUHCoach(numberOfCoachesToReturn, coachScheduleArrivalFilteredList, route2, dateString);
+					}
+					routes.add(route1);
+					routes.add(route2);
+					segment.setRoutes(routes);
+					segment.setValidCoachScheduleAvailable(true);
+				}
+			}
+			if (segment.getDestinationAirportCode().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+				boolean ifScheduleExistsCoachDepartingAUH = ifScheduleExistsArrivalFlight(
+						coachScheduleDepurtureFilteredList, segment);
+				if (!ifScheduleExistsCoachDepartingAUH) {
+					segment.setValidCoachScheduleAvailable(false);
+				} else {
+					String flightNumber = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1)
+							.getFlightNumber();
+					int coachDepartureBookingMinutes = getFlightBookingMinutesFlightArrival(flightNumber);
+					String timeString = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1)
+							.getFlightLegEndTime();
+					String dateString = segment.getLegDetailsList().get(segment.getLegDetailsList().size() - 1)
+							.getFlightLegEndDate();
+					Timestamp flightArrivalDate = addMinutes(timeString, dateString, coachDepartureBookingMinutes);
+
+					List<CoachSchedule> coachScheduleDepartureSortedList = createSortedDeputureCoachSchedule(
+							coachScheduleDepurtureFilteredList, flightArrivalDate);
+					List<Route> routes = new ArrayList<>();
+					Route route1 = constructRoutes("AUH", "AAN");
+					Route route2 = constructRoutes("AUH", "XNB");
+					int countOfAANCoaches = 0;
+					int countOfXNBCoaches = 0;
+					int numberOfCoachesToReturn = coachConfigService.getCoachConfig().get(0)
+							.getNumberOfCoachesToReturn();
+					for (CoachSchedule coachScheduleObjAAN : coachScheduleDepartureSortedList) {
+						if (coachScheduleObjAAN.getArrivalStation().equalsIgnoreCase("AAN")
+								&& countOfAANCoaches < numberOfCoachesToReturn) {
+							route1.getSchedules()
+									.add(constructSchedule(coachScheduleObjAAN.getDepartureTime().toString(),
+											coachScheduleObjAAN.getArrivalTime().toString(),
+											"EY " + coachScheduleObjAAN.getCoachNumber(), dateString));
+							countOfAANCoaches++;
+						}
+						if (coachScheduleObjAAN.getArrivalStation().equalsIgnoreCase("XNB")
+								&& countOfXNBCoaches < numberOfCoachesToReturn) {
+							route2.getSchedules()
+									.add(constructSchedule(coachScheduleObjAAN.getDepartureTime().toString(),
+											coachScheduleObjAAN.getArrivalTime().toString(),
+											"EY " + coachScheduleObjAAN.getCoachNumber(), dateString));
+							countOfXNBCoaches++;
+						}
+					}
+					if (countOfAANCoaches < numberOfCoachesToReturn) {
+						addAUHToAANCoach(numberOfCoachesToReturn, coachScheduleDepurtureFilteredList, route1,
+								dateString);
+					}
+					if (countOfXNBCoaches < numberOfCoachesToReturn) {
+						addAUHToXNBCoach(numberOfCoachesToReturn, coachScheduleDepurtureFilteredList, route2,
+								dateString);
+					}
+					routes.add(route1);
+					routes.add(route2);
+					segment.setRoutes(routes);
+					segment.setValidCoachScheduleAvailable(true);
+				}
+			}
+		}
+	}
+
+	private int getFlightBookingMinutesFlightArrival(String flightNumber) {
+		List<FlightBasedCoachBookingMin> flightArrivalBasedCoachBookingMinList = flightBasedCoachBookingMinService
+				.getFlightBasedCoachBookingMin();
+		int bookingMinutesToReturn = 0;
+		for (FlightBasedCoachBookingMin flightBasedCoachBookingMinObj : flightArrivalBasedCoachBookingMinList) {
+			if (flightBasedCoachBookingMinObj.getFlightNo().contains(flightNumber)) {
+				bookingMinutesToReturn = flightBasedCoachBookingMinObj.getCoachBookingBlackoutForArrivingFlightsMin();
+			}
+		}
+		if (bookingMinutesToReturn == 0) {
+			bookingMinutesToReturn = coachConfigService.getCoachConfig().get(0).getDefaultCoachBookingArrivalMin();
+		}
+		return bookingMinutesToReturn;
+	}
+
+	private List<CoachSchedule> coachDepurtureFromAUHSchedule(List<CoachSchedule> coachScheduleBeforeFilter) {
+		List<CoachSchedule> coachScheduleFiltered = new ArrayList<>();
+		int index = 0;
+		for (CoachSchedule coachScheduleObj : coachScheduleBeforeFilter) {
+			if (coachScheduleObj.getDepartureStation().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+				coachScheduleFiltered.add(index, coachScheduleObj);
+				index++;
+			}
+		}
+		return coachScheduleFiltered;
+	}
+
+	private Timestamp substractMinutes(String timeString, String dateString,
+			int coachArrivalOrDepartureBookingMinutes) {
+		String concatDateTimeString = dateString + " " + timeString;
+		Timestamp flightArrivalOrDepurtureDateTemp = Timestamp.valueOf(concatDateTimeString);
+		Calendar cal = Calendar.getInstance();
+		cal.setTimeInMillis(flightArrivalOrDepurtureDateTemp.getTime());
+		cal.add(Calendar.MINUTE, -coachArrivalOrDepartureBookingMinutes);
+		flightArrivalOrDepurtureDateTemp = new Timestamp(cal.getTime().getTime());
+		return flightArrivalOrDepurtureDateTemp;
+	}
+
+	private Timestamp addMinutes(String timeString, String dateString, int coachArrivalOrDepartureBookingMinutesAdd) {
+		String concatDateTimeStringAdd = dateString + " " + timeString;
+		Timestamp flightArrivalOrDepurtureDateTempAdd = Timestamp.valueOf(concatDateTimeStringAdd);
+		Calendar cal = Calendar.getInstance();
+		cal.setTimeInMillis(flightArrivalOrDepurtureDateTempAdd.getTime());
+		cal.add(Calendar.MINUTE, coachArrivalOrDepartureBookingMinutesAdd);
+		flightArrivalOrDepurtureDateTempAdd = new Timestamp(cal.getTime().getTime());
+		return flightArrivalOrDepurtureDateTempAdd;
+	}
+
+	private int getFlightBookingMinutes(String flightNumber) {
+		List<FlightBasedCoachBookingMin> flightBasedCoachBookingMinList = flightBasedCoachBookingMinService
+				.getFlightBasedCoachBookingMin();
+		int bookingMinutesToReturn = 0;
+
+		for (FlightBasedCoachBookingMin flightBasedCoachBookingMinObj : flightBasedCoachBookingMinList) {
+			if (flightBasedCoachBookingMinObj.getFlightNo().contains(flightNumber)) {
+				bookingMinutesToReturn = flightBasedCoachBookingMinObj.getCoachBookingBlackoutForDepartingFlightsMin();
+			}
+		}
+		if (bookingMinutesToReturn == 0) {
+			bookingMinutesToReturn = coachConfigService.getCoachConfig().get(0).getDefaultCoachBookingDepartureMin();
+		}
+		return bookingMinutesToReturn;
+	}
+
+	private boolean ifScheduleExists(List<CoachSchedule> coachScheduleArrivalFilteredList, Segment segment) {
+		String flightDepurtureDateString = segment.getLegDetailsList().get(0).getFlightLegStartDate();
+		String flightDepurtureTimeString = segment.getLegDetailsList().get(0).getFlightLegStartTime();
+		String concatDateTime = flightDepurtureDateString + " " + flightDepurtureTimeString;
+		Timestamp flightDepurtureDate = Timestamp.valueOf(concatDateTime);
+		boolean scheduleExists = false;
+		for (CoachSchedule coachScheduleObj : coachScheduleArrivalFilteredList) {
+			Timestamp coachValidFrom = coachScheduleObj.getValidFrom();
+			Timestamp coachValidTo = coachScheduleObj.getValidTo();
+			if (flightDepurtureDate.after(coachValidFrom) && flightDepurtureDate.before(coachValidTo)) {
+				scheduleExists = true;
+			}
+		}
+		return scheduleExists;
+	}
+
+	private boolean ifScheduleExistsArrivalFlight(List<CoachSchedule> coachScheduleArrivalFilteredList,
+			Segment segment) {
+		String flightArrivalDateString = segment.getLegDetailsList().get(0).getFlightLegEndDate();
+		String flightArrivalTimeString = segment.getLegDetailsList().get(0).getFlightLegEndTime();
+		String concatDateTime = flightArrivalDateString + " " + flightArrivalTimeString;
+		Timestamp flightArrivalDate = Timestamp.valueOf(concatDateTime);
+		boolean scheduleExistsArrival = false;
+		for (CoachSchedule coachScheduleObj : coachScheduleArrivalFilteredList) {
+			Timestamp coachValidFromArrival = coachScheduleObj.getValidFrom();
+			Timestamp coachValidToArrival = coachScheduleObj.getValidTo();
+			if (flightArrivalDate.after(coachValidFromArrival) && flightArrivalDate.before(coachValidToArrival)) {
+				scheduleExistsArrival = true;
+			}
+		}
+		return scheduleExistsArrival;
+	}
+
+	private List<CoachSchedule> createSortedCoachSchedule(List<CoachSchedule> coachScheduleArrivalFilteredList,
+			Timestamp flightDepartureDate) {
+		List<CoachSchedule> coachScheduleArrivalSortedTemp = new ArrayList<>();
+		SimpleDateFormat sdf = new SimpleDateFormat(Constants.DATE_FORMAT);
+		String date1 = sdf.format(flightDepartureDate);
+		int count = 0;
+		for (CoachSchedule coachScheduleObj : coachScheduleArrivalFilteredList) {
+			Time coachArrivalTime = coachScheduleObj.getArrivalTime();
+			try {
+				if (sdf.parse(date1).after(coachArrivalTime)) {
+					coachScheduleArrivalSortedTemp.add(count, coachScheduleObj);
+					count++;
+				}
+			} catch (ParseException e) {
+				LOGGER.error("Error in method createSortedCoachSchedule() of PNREligibilityService {}", e.getMessage());
+			}
+		}
+		coachScheduleArrivalSortedTemp
+				.sort((CoachSchedule cs1, CoachSchedule cs2) -> cs2.getArrivalTime().compareTo(cs1.getArrivalTime()));
+		return coachScheduleArrivalSortedTemp;
+	}
+
+	private void addAANToAUHCoach(int sizeToBeDisplayed, List<CoachSchedule> coachScheduleArrivalFilteredList,
+			Route route1, String dateString) {
+		SimpleDateFormat sdfCoachDepDateAAN = new SimpleDateFormat(Constants.YEAR_FORMAT);
+		Calendar cCoachDepDateAAN = Calendar.getInstance();
+		try {
+			cCoachDepDateAAN.setTime(sdfCoachDepDateAAN.parse(dateString));
+		} catch (ParseException e) {
+			LOGGER.error("Error in method addAANToAUHCoach() of PNREligibilityService {}", e.getMessage());
+		}
+		cCoachDepDateAAN.add(Calendar.DAY_OF_MONTH, -1);
+		String coachDepDateAAN = sdfCoachDepDateAAN.format(cCoachDepDateAAN.getTime());
+		List<CoachSchedule> coachScheduleArrivalAANToAUH = new ArrayList<>();
+		for (CoachSchedule coachScheduleObjAAN1 : coachScheduleArrivalFilteredList) {
+			if (coachScheduleObjAAN1.getDepartureStation().equalsIgnoreCase("AAN")) {
+				coachScheduleArrivalAANToAUH.add(coachScheduleObjAAN1);
+			}
+		}
+		coachScheduleArrivalAANToAUH.sort(
+				(CoachSchedule csA1, CoachSchedule csA2) -> csA1.getArrivalTime().compareTo(csA2.getArrivalTime()));
+		int countA = 1;
+		int countOfAANCoaches = route1.getSchedules().size();
+		for (int i = 0; i < coachScheduleArrivalAANToAUH.size(); i++) {
+			if (countOfAANCoaches < sizeToBeDisplayed) {
+				route1.getSchedules()
+						.add(constructSchedule(
+								coachScheduleArrivalAANToAUH.get(coachScheduleArrivalAANToAUH.size() - countA)
+										.getDepartureTime().toString(),
+								coachScheduleArrivalAANToAUH.get(coachScheduleArrivalAANToAUH.size() - countA)
+										.getArrivalTime().toString(),
+								"EY " + coachScheduleArrivalAANToAUH.get(coachScheduleArrivalAANToAUH.size() - countA)
+										.getCoachNumber(),
+								coachDepDateAAN));
+				countOfAANCoaches++;
+				countA++;
+			}
+		}
+	}
+
+	private void addXNBToAUHCoach(int numberOfCoachesToReturn, List<CoachSchedule> coachScheduleArrivalFilteredList,
+			Route route2, String dateString) {
+		SimpleDateFormat sdfCoachDepDateXNB = new SimpleDateFormat(Constants.YEAR_FORMAT);
+		Calendar cCoachDepDateXNB = Calendar.getInstance();
+		try {
+			cCoachDepDateXNB.setTime(sdfCoachDepDateXNB.parse(dateString));
+		} catch (ParseException e) {
+			LOGGER.error("Error in method addXNBToAUHCoach() of PNREligibilityService {}", e.getMessage());
+		}
+		cCoachDepDateXNB.add(Calendar.DAY_OF_MONTH, -1);
+		String coachDepDateXNB = sdfCoachDepDateXNB.format(cCoachDepDateXNB.getTime());
+		List<CoachSchedule> coachScheduleArrivalXNBToAUH = new ArrayList<>();
+		for (CoachSchedule coachScheduleObjXNB1 : coachScheduleArrivalFilteredList) {
+			if (coachScheduleObjXNB1.getDepartureStation().equalsIgnoreCase("XNB")) {
+				coachScheduleArrivalXNBToAUH.add(coachScheduleObjXNB1);
+			}
+		}
+		coachScheduleArrivalXNBToAUH.sort(
+				(CoachSchedule csAX1, CoachSchedule csAX2) -> csAX1.getArrivalTime().compareTo(csAX2.getArrivalTime()));
+		int countAX = 1;
+		int countOfXNBCoaches = route2.getSchedules().size();
+		for (int i = 0; i < coachScheduleArrivalXNBToAUH.size(); i++) {
+			if (countOfXNBCoaches < numberOfCoachesToReturn) {
+				route2.getSchedules().add(constructSchedule(
+						coachScheduleArrivalXNBToAUH.get(coachScheduleArrivalXNBToAUH.size() - countAX)
+								.getDepartureTime().toString(),
+						coachScheduleArrivalXNBToAUH.get(coachScheduleArrivalXNBToAUH.size() - countAX).getArrivalTime()
+								.toString(),
+						"EY " + coachScheduleArrivalFilteredList.get(coachScheduleArrivalXNBToAUH.size() - countAX)
+								.getCoachNumber(),
+						coachDepDateXNB));
+				countOfXNBCoaches++;
+				countAX++;
+			}
+		}
+
+	}
+
+	private List<CoachSchedule> createSortedDeputureCoachSchedule(
+			List<CoachSchedule> coachScheduleDepartureFilteredList, Timestamp flightArrivalDate) {
+		List<CoachSchedule> coachScheduleDepartureSortedTemp = new ArrayList<>();
+		SimpleDateFormat sdf1 = new SimpleDateFormat(Constants.DATE_FORMAT);
+		String date1 = sdf1.format(flightArrivalDate);
+		int count1 = 0;
+		for (CoachSchedule coachScheduleObj : coachScheduleDepartureFilteredList) {
+			Time coachDepurtureTime = coachScheduleObj.getDepartureTime();
+			try {
+				if (sdf1.parse(date1).before(coachDepurtureTime)) {
+					coachScheduleDepartureSortedTemp.add(count1, coachScheduleObj);
+					count1++;
+				}
+			} catch (ParseException e) {
+				LOGGER.error("Error in method createSortedDeputureCoachSchedule() of PNREligibilityService {}",
+						e.getMessage());
+			}
+		}
+		coachScheduleDepartureSortedTemp.sort(
+				(CoachSchedule cs3, CoachSchedule cs2) -> cs3.getDepartureTime().compareTo(cs2.getDepartureTime()));
+		return coachScheduleDepartureSortedTemp;
+	}
+
+	private void addAUHToAANCoach(int sizeToBeDisplayed, List<CoachSchedule> coachScheduleArrivalFilteredList,
+			Route route1, String dateString) {
+		SimpleDateFormat sdfCoachArrDateAAN = new SimpleDateFormat(Constants.YEAR_FORMAT);
+		Calendar cCoachArrDateAAN = Calendar.getInstance();
+		try {
+			cCoachArrDateAAN.setTime(sdfCoachArrDateAAN.parse(dateString));
+		} catch (ParseException e) {
+			LOGGER.error(Constants.ERROR_MESSAGE_ADD, e.getMessage());
+		}
+		cCoachArrDateAAN.add(Calendar.DAY_OF_MONTH, 1);
+		String coachArrDateAAN = sdfCoachArrDateAAN.format(cCoachArrDateAAN.getTime());
+		List<CoachSchedule> coachScheduleArrivalAUHToAAN = new ArrayList<>();
+		for (CoachSchedule coachScheduleObjAAN1 : coachScheduleArrivalFilteredList) {
+			if (coachScheduleObjAAN1.getArrivalStation().equalsIgnoreCase("AAN")) {
+				coachScheduleArrivalAUHToAAN.add(coachScheduleObjAAN1);
+			}
+		}
+		coachScheduleArrivalAUHToAAN.sort(
+				(CoachSchedule csA1, CoachSchedule csA2) -> csA1.getDepartureTime().compareTo(csA2.getDepartureTime()));
+		int countD = 0;
+		int countOfAANCoaches = route1.getSchedules().size();
+		for (int i = 0; i < coachScheduleArrivalAUHToAAN.size(); i++) {
+			if (countOfAANCoaches < sizeToBeDisplayed) {
+				route1.getSchedules().add(constructSchedule(
+						coachScheduleArrivalAUHToAAN.get(0 + countD).getDepartureTime().toString(),
+						coachScheduleArrivalAUHToAAN.get(0 + countD).getArrivalTime().toString(),
+						"EY " + coachScheduleArrivalAUHToAAN.get(0 + countD).getCoachNumber(), coachArrDateAAN));
+				countOfAANCoaches++;
+				countD++;
+			}
+		}
+	}
+
+	private void addAUHToXNBCoach(int numberOfCoachesToReturn, List<CoachSchedule> coachScheduleArrivalFilteredList,
+			Route route2, String dateString) {
+		SimpleDateFormat sdfCoachArrDateXNB = new SimpleDateFormat(Constants.YEAR_FORMAT);
+		Calendar cCoachArrDateXNB = Calendar.getInstance();
+		try {
+			cCoachArrDateXNB.setTime(sdfCoachArrDateXNB.parse(dateString));
+		} catch (ParseException e) {
+			LOGGER.error("Error in method addAUHToXNBCoach() of PNREligibilityService {}", e.getMessage());
+		}
+		cCoachArrDateXNB.add(Calendar.DAY_OF_MONTH, 1);
+		String coachArrDateXNB = sdfCoachArrDateXNB.format(cCoachArrDateXNB.getTime());
+		List<CoachSchedule> coachScheduleArrivalAUHToXNB = new ArrayList<>();
+		for (CoachSchedule coachScheduleObjXNB1 : coachScheduleArrivalFilteredList) {
+			if (coachScheduleObjXNB1.getArrivalStation().equalsIgnoreCase("XNB")) {
+				coachScheduleArrivalAUHToXNB.add(coachScheduleObjXNB1);
+			}
+		}
+		coachScheduleArrivalFilteredList.sort(
+				(CoachSchedule csAX3, CoachSchedule csAX4) -> csAX3.getArrivalTime().compareTo(csAX4.getArrivalTime()));
+		int countDX = 0;
+		int countOfXNBCoaches = route2.getSchedules().size();
+		for (int i = 0; i < coachScheduleArrivalAUHToXNB.size(); i++) {
+			if (countOfXNBCoaches < numberOfCoachesToReturn) {
+				route2.getSchedules().add(constructSchedule(
+						coachScheduleArrivalAUHToXNB.get(0 + countDX).getDepartureTime().toString(),
+						coachScheduleArrivalAUHToXNB.get(0 + countDX).getArrivalTime().toString(),
+						"EY " + coachScheduleArrivalAUHToXNB.get(0 + countDX).getCoachNumber(), coachArrDateXNB));
+				countOfXNBCoaches++;
+				countDX++;
+			}
+		}
+
+	}
+
+	private List<CoachSchedule> coachArrivalToAUHSchedule(List<CoachSchedule> coachScheduleBeforeArrivalFilter) {
+		List<CoachSchedule> coachScheduleArrivalFiltered = new ArrayList<>();
+		int index = 0;
+		for (CoachSchedule coachScheduleObj : coachScheduleBeforeArrivalFilter) {
+			if (coachScheduleObj.getArrivalStation().equalsIgnoreCase(bookCoachConfig.getCheckAirportCode())) {
+				coachScheduleArrivalFiltered.add(index, coachScheduleObj);
+				index++;
+			}
+		}
+		return coachScheduleArrivalFiltered;
+
+	}
+
+	private Route constructRoutes(String from, String to) {
+		Route route = new Route();
+		route.setFrom(from);
+		route.setTo(to);
+		route.setSchedules(new ArrayList<Schedule>());
+		return route;
+	}
+
+	private Schedule constructSchedule(String departureTime, String arrivalTime, String coachNo, String date) {
+		Schedule schedule = new Schedule();
+		schedule.setDepartureTime(departureTime);
+		schedule.setArrivalTime(arrivalTime);
+		schedule.setCoachNo(coachNo);
+		schedule.setCoachDepurtureDate(date);
+		return schedule;
+	}
+}
